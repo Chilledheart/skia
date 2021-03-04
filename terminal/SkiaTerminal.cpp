@@ -25,11 +25,22 @@
 #include <OpenGL/gl.h>
 #elif defined(SK_BUILD_FOR_IOS)
 #include <OpenGLES/ES2/gl.h>
+#elif defined(SK_BUILD_FOR_WIN)
+#include <windows.h>
+#include <GL/gl.h>
 #endif
 
-#ifndef SK_BUILD_FOR_WIN
+#if defined(SK_BUILD_FOR_WIN)
+#include <winsock2.h>
+#define EXTENDED_STARTUPINFO_PRESENT 0x00080000
+#define PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE \
+  ProcThreadAttributeValue(22, FALSE, TRUE, FALSE)
+
+typedef HRESULT (__stdcall *PFNCREATEPSEUDOCONSOLE)(COORD c, HANDLE hIn, HANDLE hOut, DWORD dwFlags, HPCON* phpcon);
+typedef HRESULT (__stdcall *PFNRESIZEPSEUDOCONSOLE)(HPCON hpc, COORD newSize);
+typedef void (__stdcall *PFNCLOSEPSEUDOCONSOLE)(HPCON hpc);
+#else
 #include <fcntl.h>
-#include <libtsm.h>
 #include <sys/ioctl.h>
 #include <sys/ttycom.h>
 #include <sys/ttydefaults.h>
@@ -42,6 +53,8 @@ extern char **environ;
 #include <pty.h>
 #endif
 #endif
+
+#include <libtsm.h>
 
 #define DEFAULT_ROW 80
 #define DEFAULT_COL 24
@@ -76,13 +89,13 @@ static SkFont *gFont;
 static void handle_size_change(ApplicationState* state, SDL_Window* window, SkCanvas* canvas,
                                int fd, struct tsm_screen* screen, struct tsm_vte* vte) {
     int dw, dh;
-    struct winsize ws;
-
     state->fFontAdvanceWidth = gFont->measureText("X", 1U, SkTextEncoding::kUTF8, NULL);
     state->fFontSpacing = std::min(1.0f, gFont->getSpacing());
 
     SDL_GL_GetDrawableSize(window, &dw, &dh);
 
+#if !defined(SK_BUILD_FOR_WIN)
+    struct winsize ws;
     ws.ws_row = (float)(dw) / state->fFontAdvanceWidth;
     ws.ws_col = (float)(dh + state->fFontSpacing) / (state->fFontSize + state->fFontSpacing) - 1;
     ws.ws_xpixel = dw;
@@ -91,6 +104,7 @@ static void handle_size_change(ApplicationState* state, SDL_Window* window, SkCa
     tsm_screen_resize(screen, ws.ws_row, ws.ws_col);
     ioctl(fd, TIOCSWINSZ, &ws);
     state->fRedraw = true;
+#endif
 }
 
 static void handle_events(ApplicationState* state, SDL_Window* window, SkCanvas* canvas,
@@ -192,6 +206,7 @@ static void handle_events(ApplicationState* state, SDL_Window* window, SkCanvas*
                     }
                 }
 
+#if !defined(SK_BUILD_FOR_WIN)
                 // following sys/ttydefaulys.h
                 if (!(modifier & KMOD_SHIFT) &&
                     modifier & KMOD_CTRL && !(modifier & KMOD_ALT)
@@ -210,6 +225,7 @@ static void handle_events(ApplicationState* state, SDL_Window* window, SkCanvas*
                     && key == SDLK_DELETE) {
                     key = SDLK_DELETE;
                 }
+#endif
 
 #if defined(SK_BUILD_FOR_MAC)
                 if (modifier & KMOD_GUI && key == SDLK_c) {
@@ -227,13 +243,12 @@ static void handle_events(ApplicationState* state, SDL_Window* window, SkCanvas*
                 break;
             }
 #if 0
-            case SDL_WINDOWEVENT: {
-                uint8_t windowevent = event.window.event;
-                if (windowevent == SDL_WINDOWEVENT_RESIZED) {
-                    // Use SDL_GL_GetDrawableSize to measure the layout change
-                    uint32_t dw = event.window.data1;
-                    uint32_t dh = event.window.data2;
-                    handle_size_change(state, window, canvas, fd, screen, vte);
+            case SDL_WINDOWEVENT:
+                switch (event.window.event) {
+                    case SDL_WINDOWEVENT_RESIZED:
+                        // Use SDL_GL_GetDrawableSize to measure the layout change
+                        handle_size_change(state, window, canvas, fd, screen, vte);
+                        break;
                 }
                 break;
             }
@@ -246,6 +261,296 @@ static void handle_events(ApplicationState* state, SDL_Window* window, SkCanvas*
         }
     }
 }
+
+// Create pty
+#if defined(SK_BUILD_FOR_WIN)
+// Initializes the specified startup info struct with the required properties and
+// updates its thread attribute list with the specified ConPTY handle
+bool InitializeStartupInfoAttachedToConPTY(STARTUPINFOEXW* siEx, HPCON hPC)
+{
+    size_t size;
+
+    // Create the appropriately sized thread attribute list
+    ::InitializeProcThreadAttributeList(NULL, 1, 0, &size);
+    std::unique_ptr<BYTE[]> attrList = std::make_unique<BYTE[]>(size);
+
+    // Set startup info's attribute list & initialize it
+    siEx->lpAttributeList = reinterpret_cast<PPROC_THREAD_ATTRIBUTE_LIST>(
+        attrList.get());
+    bool fSuccess = ::InitializeProcThreadAttributeList(
+        siEx->lpAttributeList, 1, 0, (PSIZE_T)&size);
+
+    if (fSuccess) {
+        // Set thread attribute list's Pseudo Console to the specified ConPTY
+        fSuccess = ::UpdateProcThreadAttribute(
+                        siEx->lpAttributeList,
+                        0,
+                        PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+                        hPC,
+                        sizeof(hPC),
+                        NULL,
+                        NULL);
+        return fSuccess;
+    }
+    return fSuccess;
+}
+
+HANDLE EnsureKernel32Loaded() {
+    return LoadLibraryExW(L"kernel32.dll", 0, 0);
+}
+
+struct listen_ctx {
+    HANDLE outPipeOurSide, inPipeOurSide;
+    HANDLE hPC;
+    HANDLE hThread, hProcess;
+    int socket;
+};
+
+void __cdecl listen_wndc(LPVOID lp) {
+    listen_ctx *ctx { reinterpret_cast<listen_ctx*>(lp) };
+    // Close ConPTY - this will terminate client process if running
+    HANDLE hLibrary = EnsureKernel32Loaded();
+
+    PFNCLOSEPSEUDOCONSOLE const ClosePseudoConsole = (PFNCLOSEPSEUDOCONSOLE)GetProcAddress((HMODULE)hLibrary, "ClosePseudoConsole");
+    if (ClosePseudoConsole == nullptr) {
+        return;
+    }
+
+    const DWORD BUFF_SIZE{ 512 };
+    char szBuffer[BUFF_SIZE]{};
+
+    DWORD dwBytesWritten{};
+    DWORD dwBytesRead{};
+    BOOL fRead{ FALSE };
+    do
+    {
+        // Read from the pipe
+        fRead = ::ReadFile(ctx->outPipeOurSide, szBuffer, BUFF_SIZE, &dwBytesRead, NULL);
+        if (!fRead) {
+            break;
+        }
+        ::WriteFile((HANDLE)ctx->socket, szBuffer, fRead, &dwBytesWritten, NULL);
+
+        // Write received text to the Console
+        // Note: Write to the Console using WriteFile(hConsole...), not printf()/puts() to
+        // prevent partially-read VT sequences from corrupting output
+        fRead = ::ReadFile((HANDLE)ctx->socket, szBuffer, BUFF_SIZE, &dwBytesRead, NULL);
+        if (!fRead) {
+            break;
+        }
+        ::WriteFile(ctx->inPipeOurSide, szBuffer, fRead, &dwBytesWritten, NULL);
+    } while (fRead && dwBytesRead >= 0);
+
+    // Close ConPTY - this will terminate client process if running
+    ClosePseudoConsole(ctx->hPC);
+    // Clean-up the pipes
+    ::CloseHandle(ctx->inPipeOurSide);
+    ::CloseHandle(ctx->outPipeOurSide);
+    ::closesocket(ctx->socket);
+    // Now safe to clean-up client app's process-info & thread
+    ::CloseHandle(ctx->hThread);
+    ::CloseHandle(ctx->hProcess);
+
+    delete ctx;
+}
+
+// inspired by vim's channel.c
+#pragma comment(lib, "Ws2_32.lib")
+int socket_pair(int *sfd, int *cfd) {
+    //-------------------------
+    // Initialize Winsock
+    WSADATA wsaData;
+    int iResult;
+
+    iResult = WSAStartup(MAKEWORD(2,2), &wsaData);
+    if (iResult != NO_ERROR) {
+      fprintf(stderr, "Error at WSAStartup()\n");
+      return -1;
+    }
+
+    int fd, accepted_fd = -1, sd;
+    struct sockaddr_in server = {}, client = {};
+    int client_len = sizeof(client), server_len = sizeof(server);
+    u_long val = 1;
+
+    fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    sd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd == -1 || sd == -1) {
+        goto fail;
+    }
+
+    server.sin_family = AF_INET;
+    server.sin_port = htons(0);
+
+    if (::bind(fd, (struct sockaddr*)&server, sizeof(server)) < 0 ||
+        ::listen(fd, 1) < 0 ||
+        ::getsockname(fd, (struct sockaddr*)&server, &server_len) < 0 ||
+        ::ioctlsocket(sd, FIONBIO, &val) < 0 || /* Make connect() non-blocking. */
+        ::connect(sd, (struct sockaddr*)&server, sizeof(server)) < 0 ||
+        (accepted_fd = ::accept(fd, (struct sockaddr*)&client, &client_len)) < 0 ||
+        ::ioctlsocket(accepted_fd, FIONBIO, &val) < 0) {
+        goto fail;
+    }
+    ::closesocket(fd);
+    *sfd = accepted_fd;
+    *cfd = sd;
+
+    return 0;
+fail:
+    ::closesocket(fd);
+    ::closesocket(sd);
+    ::closesocket(accepted_fd);
+    return -1;
+}
+
+bool create_conpty(int dw, int dh, int ws_row, int ws_col, int *fd, ApplicationState *state) {
+    HANDLE hLibrary = EnsureKernel32Loaded();
+    PFNCREATEPSEUDOCONSOLE const CreatePseudoConsole = (PFNCREATEPSEUDOCONSOLE)GetProcAddress((HMODULE)hLibrary, "CreatePseudoConsole");
+    if (CreatePseudoConsole == nullptr) {
+        return false;
+    }
+
+    HANDLE thread;
+    HANDLE outPipeOurSide, inPipeOurSide;
+    HANDLE outPipePseudoConsoleSide, inPipePseudoConsoleSide;
+    HPCON hPC = 0;
+    COORD consize;
+    BOOL fSuccess;
+    int client;
+    listen_ctx *ctx;
+
+    // Create the in/out pipes:
+    if (!::CreatePipe(&inPipePseudoConsoleSide, &inPipeOurSide, NULL, 0) ||
+        !::CreatePipe(&outPipeOurSide, &outPipePseudoConsoleSide, NULL, 0)) {
+        return false;
+    }
+
+    // Create the Pseudo Console, using the pipes
+    consize.X = ws_row;
+    consize.Y = ws_col;
+    CreatePseudoConsole(
+        consize,
+        inPipePseudoConsoleSide,
+        outPipePseudoConsoleSide,
+        0,
+        &hPC);
+
+    // Prepare the StartupInfoEx structure attached to the ConPTY.
+    STARTUPINFOEXW startupInfo {};
+    startupInfo.StartupInfo.cb = sizeof(STARTUPINFOEX);
+
+    if (!InitializeStartupInfoAttachedToConPTY(&startupInfo, hPC)) {
+        return false;
+    }
+
+    // Create the client application, using startup info containing ConPTY info
+    wchar_t expanded_commandline[MAX_PATH];
+    const wchar_t *commandline = L"%WINDIR%\\system32\\cmd.exe";
+    ::ExpandEnvironmentStringsW(commandline, expanded_commandline, sizeof(expanded_commandline));
+
+    PROCESS_INFORMATION process_information {};
+
+    fSuccess = ::CreateProcessW(
+                    nullptr,                       // No module ame - use Command Line
+                    expanded_commandline,          // Command Line
+                    nullptr,                       // Process handle not inheriable
+                    nullptr,                       // Thread handle not inheriable
+                    TRUE,                          // Inherit handles
+                    EXTENDED_STARTUPINFO_PRESENT,  // Creation flags
+                    nullptr,                       // Use parent's environment block
+                    nullptr,                       // Use parent's starting directory
+                    &startupInfo.StartupInfo,      // Pointer to STARTUPINFO
+                    &process_information);         // Pointer to PROCESS_INFORMATION
+
+    if (!fSuccess) {
+        ::CloseHandle(inPipeOurSide);
+        ::CloseHandle(outPipeOurSide);
+        goto cleanup;
+    }
+    ctx = new listen_ctx;
+    ctx->outPipeOurSide = outPipeOurSide;
+    ctx->inPipeOurSide = inPipeOurSide;
+    ctx->hPC = hPC;
+    ctx->hThread = process_information.hThread;
+    ctx->hProcess = process_information.hProcess;
+    if (socket_pair(&ctx->socket, &client) < 0) {
+        fSuccess = false;
+        goto cleanup;
+    }
+    *fd = client;
+
+    // Create & start thread to listen to the incoming pipe
+    // Note: Using CRT-safe _beginthread() rather than CreateThread()
+    thread = reinterpret_cast<HANDLE>(_beginthread(listen_wndc, 0, ctx));
+
+cleanup:
+    ::DeleteProcThreadAttributeList(startupInfo.lpAttributeList);
+    delete[] (BYTE*)startupInfo.lpAttributeList;
+    ::CloseHandle(inPipePseudoConsoleSide);
+    ::CloseHandle(outPipePseudoConsoleSide);
+    return fSuccess;
+}
+#else
+bool create_conpty(int dw, int dh, int ws_row, int ws_col, int *fd, ApplicationState *state) {
+    struct termios term {};
+    struct winsize ws {};
+
+    term.c_iflag = TTYDEF_IFLAG | IUTF8;
+    term.c_oflag = TTYDEF_OFLAG;
+    term.c_lflag = TTYDEF_LFLAG | ECHONL | PENDIN;
+    term.c_cflag = TTYDEF_CFLAG;
+
+    term.c_ispeed = TTYDEF_SPEED;
+    term.c_ospeed = TTYDEF_SPEED;
+
+    term.c_cc[VEOF] = CEOF;          // ICANON
+    term.c_cc[VEOL] = CEOL;          // ICANON
+    term.c_cc[VEOL2] = CEOL;         // ICANON together with IEXTEN
+    term.c_cc[VERASE] = CERASE;      // ICANON
+    term.c_cc[VINTR] = CINTR;        // ISIG
+#ifdef VSTATUS
+    term.c_cc[VSTATUS] = CSTATUS;    // ICANON together with IEXTEN
+#endif
+    term.c_cc[VKILL] = CKILL;        // ICANON
+    term.c_cc[VMIN] = CMIN;          // !ICANON
+    term.c_cc[VQUIT] = CQUIT;        // ISIG
+#ifdef VSUSP
+    term.c_cc[VSUSP] = CSUSP;        // ISIG
+#endif
+    term.c_cc[VTIME] = CTIME;        // !ICANON
+#ifdef VDSUSP
+    term.c_cc[VDSUSP] = CDSUSP;      // ISIG together with IEXTEN
+#endif
+    term.c_cc[VSTART] = CSTART;      // IXON, IXOFF
+    term.c_cc[VSTOP] = CSTOP;        // IXON, IXOFF
+    term.c_cc[VLNEXT] = CLNEXT;      // IEXTEN
+    term.c_cc[VDISCARD] = CDISCARD;  // IEXTEN
+    term.c_cc[VWERASE] = CWERASE;    // ICANON together with IEXTEN
+    term.c_cc[VREPRINT] = CREPRINT;  // ICANON together with IEXTEN
+
+    ws.ws_row = ws_row;
+    ws.ws_col = ws_col;
+    ws.ws_xpixel = dw;
+    ws.ws_ypixel = dh;
+
+    // Using the same way just like Terminal.app
+    pid_t pid = forkpty(fd, NULL, &term, &ws);
+    if (pid == 0) {
+        setenv("TERM", "xterm-256color", 1);
+        const char* childArgv[] = {"/bin/bash", "-la", NULL};
+        execve(childArgv[0], (char**)childArgv, (char**)environ);
+        return false;
+    }
+
+    if (pid < 0) {
+        SkDebugf("something wrong with forkpty\n");
+        return false;
+    }
+    fcntl(*fd, F_SETFL, O_NONBLOCK);
+
+    return true;
+}
+#endif
 
 // Creates a star type shape using a SkPath
 static SkPath create_star() {
@@ -278,119 +583,132 @@ static void log_tsm(void* data, const char* file, int line, const char* fn, cons
     SkDebugf("%s\n", buffer);
 }
 
+#if defined(SK_BUILD_FOR_WIN)
 static void term_write_cb(struct tsm_vte* vte, const char* u8, size_t len, void* data) {
-    int* pFd = reinterpret_cast<int*>(data);
-    write(*pFd, u8, len);
+    int fd = reinterpret_cast<intptr_t>(data);
+    send(fd, u8, len, 0);
 }
+static int term_read_cb(struct tsm_vte* vte, char* u8, size_t len, int fd) {
+    return recv(fd, u8, len, 0);
+}
+#else
+static void term_write_cb(struct tsm_vte* vte, const char* u8, size_t len, void* data) {
+    int fd = reinterpret_cast<intptr_t>(data);
+    write(fd, u8, len);
+}
+static int term_read_cb(struct tsm_vte* vte, char* u8, size_t len, int fd) {
+    return read(fd, u8, len);
+}
+#endif
 
 enum vte_color {
-    COLOR_BLACK,
-    COLOR_RED,
-    COLOR_GREEN,
-    COLOR_YELLOW,
-    COLOR_BLUE,
-    COLOR_MAGENTA,
-    COLOR_CYAN,
-    COLOR_LIGHT_GREY,
-    COLOR_DARK_GREY,
-    COLOR_LIGHT_RED,
-    COLOR_LIGHT_GREEN,
-    COLOR_LIGHT_YELLOW,
-    COLOR_LIGHT_BLUE,
-    COLOR_LIGHT_MAGENTA,
-    COLOR_LIGHT_CYAN,
-    COLOR_WHITE,
-    COLOR_FOREGROUND,
-    COLOR_BACKGROUND,
-    COLOR_NUM
+    VTE_COLOR_BLACK,
+    VTE_COLOR_RED,
+    VTE_COLOR_GREEN,
+    VTE_COLOR_YELLOW,
+    VTE_COLOR_BLUE,
+    VTE_COLOR_MAGENTA,
+    VTE_COLOR_CYAN,
+    VTE_COLOR_LIGHT_GREY,
+    VTE_COLOR_DARK_GREY,
+    VTE_COLOR_LIGHT_RED,
+    VTE_COLOR_LIGHT_GREEN,
+    VTE_COLOR_LIGHT_YELLOW,
+    VTE_COLOR_LIGHT_BLUE,
+    VTE_COLOR_LIGHT_MAGENTA,
+    VTE_COLOR_LIGHT_CYAN,
+    VTE_COLOR_WHITE,
+    VTE_COLOR_FOREGROUND,
+    VTE_COLOR_BACKGROUND,
+    VTE_COLOR_NUM
 };
 
-static uint8_t color_palette[COLOR_NUM][3] = {
-        [COLOR_BLACK] = {0, 0, 0},             /* black */
-        [COLOR_RED] = {205, 0, 0},             /* red */
-        [COLOR_GREEN] = {0, 205, 0},           /* green */
-        [COLOR_YELLOW] = {205, 205, 0},        /* yellow */
-        [COLOR_BLUE] = {0, 0, 238},            /* blue */
-        [COLOR_MAGENTA] = {205, 0, 205},       /* magenta */
-        [COLOR_CYAN] = {0, 205, 205},          /* cyan */
-        [COLOR_LIGHT_GREY] = {229, 229, 229},  /* light grey */
-        [COLOR_DARK_GREY] = {127, 127, 127},   /* dark grey */
-        [COLOR_LIGHT_RED] = {255, 0, 0},       /* light red */
-        [COLOR_LIGHT_GREEN] = {0, 255, 0},     /* light green */
-        [COLOR_LIGHT_YELLOW] = {255, 255, 0},  /* light yellow */
-        [COLOR_LIGHT_BLUE] = {92, 92, 255},    /* light blue */
-        [COLOR_LIGHT_MAGENTA] = {255, 0, 255}, /* light magenta */
-        [COLOR_LIGHT_CYAN] = {0, 255, 255},    /* light cyan */
-        [COLOR_WHITE] = {255, 255, 255},       /* white */
+static uint8_t VTE_COLOR_palette[VTE_COLOR_NUM][3] = {
+        [VTE_COLOR_BLACK] = {0, 0, 0},             /* black */
+        [VTE_COLOR_RED] = {205, 0, 0},             /* red */
+        [VTE_COLOR_GREEN] = {0, 205, 0},           /* green */
+        [VTE_COLOR_YELLOW] = {205, 205, 0},        /* yellow */
+        [VTE_COLOR_BLUE] = {0, 0, 238},            /* blue */
+        [VTE_COLOR_MAGENTA] = {205, 0, 205},       /* magenta */
+        [VTE_COLOR_CYAN] = {0, 205, 205},          /* cyan */
+        [VTE_COLOR_LIGHT_GREY] = {229, 229, 229},  /* light grey */
+        [VTE_COLOR_DARK_GREY] = {127, 127, 127},   /* dark grey */
+        [VTE_COLOR_LIGHT_RED] = {255, 0, 0},       /* light red */
+        [VTE_COLOR_LIGHT_GREEN] = {0, 255, 0},     /* light green */
+        [VTE_COLOR_LIGHT_YELLOW] = {255, 255, 0},  /* light yellow */
+        [VTE_COLOR_LIGHT_BLUE] = {92, 92, 255},    /* light blue */
+        [VTE_COLOR_LIGHT_MAGENTA] = {255, 0, 255}, /* light magenta */
+        [VTE_COLOR_LIGHT_CYAN] = {0, 255, 255},    /* light cyan */
+        [VTE_COLOR_WHITE] = {255, 255, 255},       /* white */
 
-        [COLOR_FOREGROUND] = {229, 229, 229}, /* light grey */
-        [COLOR_BACKGROUND] = {0, 0, 0},       /* black */
+        [VTE_COLOR_FOREGROUND] = {229, 229, 229}, /* light grey */
+        [VTE_COLOR_BACKGROUND] = {0, 0, 0},       /* black */
 };
 
-static uint8_t color_palette_solarized[COLOR_NUM][3] = {
-        [COLOR_BLACK] = {7, 54, 66},             /* black */
-        [COLOR_RED] = {220, 50, 47},             /* red */
-        [COLOR_GREEN] = {133, 153, 0},           /* green */
-        [COLOR_YELLOW] = {181, 137, 0},          /* yellow */
-        [COLOR_BLUE] = {38, 139, 210},           /* blue */
-        [COLOR_MAGENTA] = {211, 54, 130},        /* magenta */
-        [COLOR_CYAN] = {42, 161, 152},           /* cyan */
-        [COLOR_LIGHT_GREY] = {238, 232, 213},    /* light grey */
-        [COLOR_DARK_GREY] = {0, 43, 54},         /* dark grey */
-        [COLOR_LIGHT_RED] = {203, 75, 22},       /* light red */
-        [COLOR_LIGHT_GREEN] = {88, 110, 117},    /* light green */
-        [COLOR_LIGHT_YELLOW] = {101, 123, 131},  /* light yellow */
-        [COLOR_LIGHT_BLUE] = {131, 148, 150},    /* light blue */
-        [COLOR_LIGHT_MAGENTA] = {108, 113, 196}, /* light magenta */
-        [COLOR_LIGHT_CYAN] = {147, 161, 161},    /* light cyan */
-        [COLOR_WHITE] = {253, 246, 227},         /* white */
+static uint8_t VTE_COLOR_palette_solarized[VTE_COLOR_NUM][3] = {
+        [VTE_COLOR_BLACK] = {7, 54, 66},             /* black */
+        [VTE_COLOR_RED] = {220, 50, 47},             /* red */
+        [VTE_COLOR_GREEN] = {133, 153, 0},           /* green */
+        [VTE_COLOR_YELLOW] = {181, 137, 0},          /* yellow */
+        [VTE_COLOR_BLUE] = {38, 139, 210},           /* blue */
+        [VTE_COLOR_MAGENTA] = {211, 54, 130},        /* magenta */
+        [VTE_COLOR_CYAN] = {42, 161, 152},           /* cyan */
+        [VTE_COLOR_LIGHT_GREY] = {238, 232, 213},    /* light grey */
+        [VTE_COLOR_DARK_GREY] = {0, 43, 54},         /* dark grey */
+        [VTE_COLOR_LIGHT_RED] = {203, 75, 22},       /* light red */
+        [VTE_COLOR_LIGHT_GREEN] = {88, 110, 117},    /* light green */
+        [VTE_COLOR_LIGHT_YELLOW] = {101, 123, 131},  /* light yellow */
+        [VTE_COLOR_LIGHT_BLUE] = {131, 148, 150},    /* light blue */
+        [VTE_COLOR_LIGHT_MAGENTA] = {108, 113, 196}, /* light magenta */
+        [VTE_COLOR_LIGHT_CYAN] = {147, 161, 161},    /* light cyan */
+        [VTE_COLOR_WHITE] = {253, 246, 227},         /* white */
 
-        [COLOR_FOREGROUND] = {238, 232, 213}, /* light grey */
-        [COLOR_BACKGROUND] = {7, 54, 66},     /* black */
+        [VTE_COLOR_FOREGROUND] = {238, 232, 213}, /* light grey */
+        [VTE_COLOR_BACKGROUND] = {7, 54, 66},     /* black */
 };
 
-static uint8_t color_palette_solarized_black[COLOR_NUM][3] = {
-        [COLOR_BLACK] = {0, 0, 0},               /* black */
-        [COLOR_RED] = {220, 50, 47},             /* red */
-        [COLOR_GREEN] = {133, 153, 0},           /* green */
-        [COLOR_YELLOW] = {181, 137, 0},          /* yellow */
-        [COLOR_BLUE] = {38, 139, 210},           /* blue */
-        [COLOR_MAGENTA] = {211, 54, 130},        /* magenta */
-        [COLOR_CYAN] = {42, 161, 152},           /* cyan */
-        [COLOR_LIGHT_GREY] = {238, 232, 213},    /* light grey */
-        [COLOR_DARK_GREY] = {0, 43, 54},         /* dark grey */
-        [COLOR_LIGHT_RED] = {203, 75, 22},       /* light red */
-        [COLOR_LIGHT_GREEN] = {88, 110, 117},    /* light green */
-        [COLOR_LIGHT_YELLOW] = {101, 123, 131},  /* light yellow */
-        [COLOR_LIGHT_BLUE] = {131, 148, 150},    /* light blue */
-        [COLOR_LIGHT_MAGENTA] = {108, 113, 196}, /* light magenta */
-        [COLOR_LIGHT_CYAN] = {147, 161, 161},    /* light cyan */
-        [COLOR_WHITE] = {253, 246, 227},         /* white */
+static uint8_t VTE_COLOR_palette_solarized_black[VTE_COLOR_NUM][3] = {
+        [VTE_COLOR_BLACK] = {0, 0, 0},               /* black */
+        [VTE_COLOR_RED] = {220, 50, 47},             /* red */
+        [VTE_COLOR_GREEN] = {133, 153, 0},           /* green */
+        [VTE_COLOR_YELLOW] = {181, 137, 0},          /* yellow */
+        [VTE_COLOR_BLUE] = {38, 139, 210},           /* blue */
+        [VTE_COLOR_MAGENTA] = {211, 54, 130},        /* magenta */
+        [VTE_COLOR_CYAN] = {42, 161, 152},           /* cyan */
+        [VTE_COLOR_LIGHT_GREY] = {238, 232, 213},    /* light grey */
+        [VTE_COLOR_DARK_GREY] = {0, 43, 54},         /* dark grey */
+        [VTE_COLOR_LIGHT_RED] = {203, 75, 22},       /* light red */
+        [VTE_COLOR_LIGHT_GREEN] = {88, 110, 117},    /* light green */
+        [VTE_COLOR_LIGHT_YELLOW] = {101, 123, 131},  /* light yellow */
+        [VTE_COLOR_LIGHT_BLUE] = {131, 148, 150},    /* light blue */
+        [VTE_COLOR_LIGHT_MAGENTA] = {108, 113, 196}, /* light magenta */
+        [VTE_COLOR_LIGHT_CYAN] = {147, 161, 161},    /* light cyan */
+        [VTE_COLOR_WHITE] = {253, 246, 227},         /* white */
 
-        [COLOR_FOREGROUND] = {238, 232, 213}, /* light grey */
-        [COLOR_BACKGROUND] = {0, 0, 0},       /* black */
+        [VTE_COLOR_FOREGROUND] = {238, 232, 213}, /* light grey */
+        [VTE_COLOR_BACKGROUND] = {0, 0, 0},       /* black */
 };
 
-static uint8_t color_palette_solarized_white[COLOR_NUM][3] = {
-        [COLOR_BLACK] = {7, 54, 66},             /* black */
-        [COLOR_RED] = {220, 50, 47},             /* red */
-        [COLOR_GREEN] = {133, 153, 0},           /* green */
-        [COLOR_YELLOW] = {181, 137, 0},          /* yellow */
-        [COLOR_BLUE] = {38, 139, 210},           /* blue */
-        [COLOR_MAGENTA] = {211, 54, 130},        /* magenta */
-        [COLOR_CYAN] = {42, 161, 152},           /* cyan */
-        [COLOR_LIGHT_GREY] = {238, 232, 213},    /* light grey */
-        [COLOR_DARK_GREY] = {0, 43, 54},         /* dark grey */
-        [COLOR_LIGHT_RED] = {203, 75, 22},       /* light red */
-        [COLOR_LIGHT_GREEN] = {88, 110, 117},    /* light green */
-        [COLOR_LIGHT_YELLOW] = {101, 123, 131},  /* light yellow */
-        [COLOR_LIGHT_BLUE] = {131, 148, 150},    /* light blue */
-        [COLOR_LIGHT_MAGENTA] = {108, 113, 196}, /* light magenta */
-        [COLOR_LIGHT_CYAN] = {147, 161, 161},    /* light cyan */
-        [COLOR_WHITE] = {253, 246, 227},         /* white */
+static uint8_t VTE_COLOR_palette_solarized_white[VTE_COLOR_NUM][3] = {
+        [VTE_COLOR_BLACK] = {7, 54, 66},             /* black */
+        [VTE_COLOR_RED] = {220, 50, 47},             /* red */
+        [VTE_COLOR_GREEN] = {133, 153, 0},           /* green */
+        [VTE_COLOR_YELLOW] = {181, 137, 0},          /* yellow */
+        [VTE_COLOR_BLUE] = {38, 139, 210},           /* blue */
+        [VTE_COLOR_MAGENTA] = {211, 54, 130},        /* magenta */
+        [VTE_COLOR_CYAN] = {42, 161, 152},           /* cyan */
+        [VTE_COLOR_LIGHT_GREY] = {238, 232, 213},    /* light grey */
+        [VTE_COLOR_DARK_GREY] = {0, 43, 54},         /* dark grey */
+        [VTE_COLOR_LIGHT_RED] = {203, 75, 22},       /* light red */
+        [VTE_COLOR_LIGHT_GREEN] = {88, 110, 117},    /* light green */
+        [VTE_COLOR_LIGHT_YELLOW] = {101, 123, 131},  /* light yellow */
+        [VTE_COLOR_LIGHT_BLUE] = {131, 148, 150},    /* light blue */
+        [VTE_COLOR_LIGHT_MAGENTA] = {108, 113, 196}, /* light magenta */
+        [VTE_COLOR_LIGHT_CYAN] = {147, 161, 161},    /* light cyan */
+        [VTE_COLOR_WHITE] = {253, 246, 227},         /* white */
 
-        [COLOR_FOREGROUND] = {7, 54, 66},     /* black */
-        [COLOR_BACKGROUND] = {238, 232, 213}, /* light grey */
+        [VTE_COLOR_FOREGROUND] = {7, 54, 66},     /* black */
+        [VTE_COLOR_BACKGROUND] = {238, 232, 213}, /* light grey */
 };
 
 static SkColor term_get_fc_from_attr(const struct tsm_screen_attr* attr) {
@@ -401,11 +719,11 @@ static SkColor term_get_fc_from_attr(const struct tsm_screen_attr* attr) {
         /* bold causes light colors */
         if (attr->bold && code < 8) code += 8;
 
-        if (code >= COLOR_NUM) code = COLOR_FOREGROUND;
+        if (code >= VTE_COLOR_NUM) code = VTE_COLOR_FOREGROUND;
 
-        fr = color_palette_solarized_white[code][0];
-        fg = color_palette_solarized_white[code][1];
-        fb = color_palette_solarized_white[code][2];
+        fr = VTE_COLOR_palette_solarized_white[code][0];
+        fg = VTE_COLOR_palette_solarized_white[code][1];
+        fb = VTE_COLOR_palette_solarized_white[code][2];
     }
 
     return SkColorSetARGB(0xFF, fr, fg, fb);
@@ -418,11 +736,11 @@ static SkColor term_get_bc_from_attr(const struct tsm_screen_attr* attr) {
         uint8_t code = attr->bccode;
         /* bold causes light colors */
 
-        if (code >= COLOR_NUM) code = COLOR_BACKGROUND;
+        if (code >= VTE_COLOR_NUM) code = VTE_COLOR_BACKGROUND;
 
-        br = color_palette_solarized_white[code][0];
-        bg = color_palette_solarized_white[code][1];
-        bb = color_palette_solarized_white[code][2];
+        br = VTE_COLOR_palette_solarized_white[code][0];
+        bg = VTE_COLOR_palette_solarized_white[code][1];
+        bb = VTE_COLOR_palette_solarized_white[code][2];
     }
 
     return SkColorSetARGB(0xFF, br, bg, bb);
@@ -514,7 +832,7 @@ static int draw_cb(struct tsm_screen* con,
     return 0;
 }
 
-#if defined(SK_BUILD_FOR_ANDROID)
+#if defined(SK_BUILD_FOR_ANDROID) || defined(SK_BUILD_FOR_WIN)
 int SDL_main(int argc, char** argv) {
 #else
 int main(int argc, char** argv) {
@@ -576,7 +894,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    assert(typeface->isFixedPitch());
+    // SkASSERT(typeface->isFixedPitch());
     state.fFontAdvanceWidth = gFont->measureText("X", 1U, SkTextEncoding::kUTF8, NULL);
     state.fFontSpacing = std::min(1.0f, gFont->getSpacing());
 
@@ -680,61 +998,12 @@ int main(int argc, char** argv) {
 
     sk_sp<SkImage> image = cpuSurface->makeImageSnapshot();
 
-    struct termios term {};
-    struct winsize ws {};
-
-    term.c_iflag = TTYDEF_IFLAG | IUTF8;
-    term.c_oflag = TTYDEF_OFLAG;
-    term.c_lflag = TTYDEF_LFLAG | ECHONL | PENDIN;
-    term.c_cflag = TTYDEF_CFLAG;
-
-    term.c_ispeed = TTYDEF_SPEED;
-    term.c_ospeed = TTYDEF_SPEED;
-
-    term.c_cc[VEOF] = CEOF;          // ICANON
-    term.c_cc[VEOL] = CEOL;          // ICANON
-    term.c_cc[VEOL2] = CEOL;         // ICANON together with IEXTEN
-    term.c_cc[VERASE] = CERASE;      // ICANON
-    term.c_cc[VINTR] = CINTR;        // ISIG
-#ifdef VSTATUS
-    term.c_cc[VSTATUS] = CSTATUS;    // ICANON together with IEXTEN
-#endif
-    term.c_cc[VKILL] = CKILL;        // ICANON
-    term.c_cc[VMIN] = CMIN;          // !ICANON
-    term.c_cc[VQUIT] = CQUIT;        // ISIG
-#ifdef VSUSP
-    term.c_cc[VSUSP] = CSUSP;        // ISIG
-#endif
-    term.c_cc[VTIME] = CTIME;        // !ICANON
-#ifdef VDSUSP
-    term.c_cc[VDSUSP] = CDSUSP;      // ISIG together with IEXTEN
-#endif
-    term.c_cc[VSTART] = CSTART;      // IXON, IXOFF
-    term.c_cc[VSTOP] = CSTOP;        // IXON, IXOFF
-    term.c_cc[VLNEXT] = CLNEXT;      // IEXTEN
-    term.c_cc[VDISCARD] = CDISCARD;  // IEXTEN
-    term.c_cc[VWERASE] = CWERASE;    // ICANON together with IEXTEN
-    term.c_cc[VREPRINT] = CREPRINT;  // ICANON together with IEXTEN
-
-    ws.ws_row = (float)(dw) / state.fFontAdvanceWidth;
-    ws.ws_col = (float)(dh + state.fFontSpacing) / (state.fFontSize + state.fFontSpacing) - 1;
-    ws.ws_xpixel = dw;
-    ws.ws_ypixel = dh;
-    int fd = -1;
-
-    // Using the same way just like Terminal.app
-    pid_t pid = forkpty(&fd, NULL, &term, &ws);
-    if (pid == 0) {
-        setenv("TERM", "xterm-256color", 1);
-        const char* childArgv[] = {"/bin/bash", "-la", NULL};
-        execve(childArgv[0], (char**)childArgv, (char**)environ);
-        return 0;
-    }
-    if (pid < 0) {
-        SkDebugf("something wrong with forkpty\n");
+    int fd {-1};
+    int ws_row = (float)(dw) / state.fFontAdvanceWidth;
+    int ws_col = (float)(dh + state.fFontSpacing) / (state.fFontSize + state.fFontSpacing) - 1;
+    if (!create_conpty(dw, dh, ws_row, ws_col, &fd, &state)) {
         return -1;
     }
-    fcntl(fd, F_SETFL, O_NONBLOCK);
 
     // create a software-based virtual terminal
     struct tsm_screen* screen;
@@ -743,10 +1012,10 @@ int main(int argc, char** argv) {
     tsm_screen_new(&screen, log_tsm, screen);
     tsm_screen_set_max_sb(screen, 10240);
 
-    SkDebugf("resize row %d col %d\n", ws.ws_row, ws.ws_col);
-    tsm_screen_resize(screen, ws.ws_row, ws.ws_col);
+    SkDebugf("resize row %d col %d\n", ws_row, ws_col);
+    tsm_screen_resize(screen, ws_row, ws_col);
 
-    tsm_vte_new(&vte, screen, term_write_cb, &fd, log_tsm, screen);
+    tsm_vte_new(&vte, screen, term_write_cb, reinterpret_cast<void*>(static_cast<intptr_t>(fd)), log_tsm, screen);
 
     sk_sp<SkImage> termImage;
 
@@ -759,8 +1028,9 @@ int main(int argc, char** argv) {
         canvas->clear(SK_ColorWHITE);
         handle_events(&state, window, canvas, fd, screen, vte);
 
+        int read_len = -1;
         char buffer[4096];
-        ssize_t read_len = read(fd, buffer, sizeof(buffer));
+        read_len = term_read_cb(vte, buffer, sizeof(buffer), fd);
 
         if (read_len > 0) {
             SkDebugf("read %d %ld\n", fd, read_len);

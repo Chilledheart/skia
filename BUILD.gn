@@ -2735,8 +2735,7 @@ if (skia_enable_tools) {
     }
   }
 
-  if ((is_linux || is_mac || is_ios || is_android) && target_cpu != "mips64el" &&
-      target_cpu != "loongson3a") {
+  if (skia_use_gl && (is_win || is_linux || is_mac || is_ios || is_android)) {
     test_app("SkiaTerminal") {
       sources = [
         "terminal/SkiaTerminal.cpp",
