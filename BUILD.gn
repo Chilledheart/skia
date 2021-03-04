@@ -2735,6 +2735,23 @@ if (skia_enable_tools) {
     }
   }
 
+  if ((is_linux || is_mac || is_ios || is_android) && target_cpu != "mips64el" &&
+      target_cpu != "loongson3a") {
+    test_app("SkiaTerminal") {
+      sources = [
+        "terminal/SkiaTerminal.cpp",
+      ]
+      libs = []
+      deps = [
+        ":gpu_tool_utils",
+        ":skia",
+        "//third_party/libsdl",
+        "//third_party/libtsm",
+      ]
+    }
+  }
+
+
   if (skia_qt_path != "" && (is_win || is_linux || is_mac)) {
     action_foreach("generate_mocs") {
       script = "gn/call.py"
