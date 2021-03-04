@@ -40,6 +40,9 @@ typedef HRESULT (__stdcall *PFNCREATEPSEUDOCONSOLE)(COORD c, HANDLE hIn, HANDLE 
 typedef HRESULT (__stdcall *PFNRESIZEPSEUDOCONSOLE)(HPCON hpc, COORD newSize);
 typedef void (__stdcall *PFNCLOSEPSEUDOCONSOLE)(HPCON hpc);
 #else
+#include <errno.h>
+#include <string.h>
+
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <sys/ttycom.h>
@@ -131,7 +134,6 @@ static void handle_events(ApplicationState* state, SDL_Window* window, SkCanvas*
                 SDL_Keycode key = event.key.keysym.sym;
                 SDL_Scancode scancode = SDL_GetScancodeFromKey(key);
                 uint16_t modifier = event.key.keysym.mod;
-                SkDebugf("%d %d\n", key, scancode);
 
                 /* SHIFT + UP/DOWN/PAGEUP/PAGEDOWN */
                 if (modifier & (KMOD_LSHIFT | KMOD_RSHIFT)) {
@@ -275,16 +277,13 @@ bool InitializeStartupInfoAttachedToConPTY(STARTUPINFOEXW* siEx, HPCON hPC)
     std::unique_ptr<BYTE[]> attrList = std::make_unique<BYTE[]>(size);
 
     // Set startup info's attribute list & initialize it
-    siEx->lpAttributeList = reinterpret_cast<PPROC_THREAD_ATTRIBUTE_LIST>(
-        attrList.get());
+    siEx->lpAttributeList = reinterpret_cast<PPROC_THREAD_ATTRIBUTE_LIST>(attrList.get());
     bool fSuccess = ::InitializeProcThreadAttributeList(
         siEx->lpAttributeList, 1, 0, (PSIZE_T)&size);
 
     if (fSuccess) {
         // Set thread attribute list's Pseudo Console to the specified ConPTY
-        fSuccess = ::UpdateProcThreadAttribute(
-                        siEx->lpAttributeList,
-                        0,
+        fSuccess = ::UpdateProcThreadAttribute(siEx->lpAttributeList, 0,
                         PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
                         hPC,
                         sizeof(hPC),
@@ -428,12 +427,7 @@ bool create_conpty(int dw, int dh, int ws_row, int ws_col, int *fd, ApplicationS
     // Create the Pseudo Console, using the pipes
     consize.X = ws_row;
     consize.Y = ws_col;
-    CreatePseudoConsole(
-        consize,
-        inPipePseudoConsoleSide,
-        outPipePseudoConsoleSide,
-        0,
-        &hPC);
+    CreatePseudoConsole(consize, inPipePseudoConsoleSide, outPipePseudoConsoleSide, 0, &hPC);
 
     // Prepare the StartupInfoEx structure attached to the ConPTY.
     STARTUPINFOEXW startupInfo {};
@@ -534,16 +528,16 @@ bool create_conpty(int dw, int dh, int ws_row, int ws_col, int *fd, ApplicationS
     ws.ws_ypixel = dh;
 
     // Using the same way just like Terminal.app
-    pid_t pid = forkpty(fd, NULL, &term, &ws);
+    pid_t pid = ::forkpty(fd, NULL, &term, &ws);
     if (pid == 0) {
-        setenv("TERM", "xterm-256color", 1);
+        ::setenv("TERM", "xterm-256color", 1);
         const char* childArgv[] = {"/bin/bash", "-la", NULL};
-        execve(childArgv[0], (char**)childArgv, (char**)environ);
+        ::execve(childArgv[0], (char**)childArgv, (char**)environ);
         return false;
     }
 
     if (pid < 0) {
-        SkDebugf("something wrong with forkpty\n");
+        SkDebugf("something wrong with forkpty: %s\n", strerror(errno));
         return false;
     }
     fcntl(*fd, F_SETFL, O_NONBLOCK);
@@ -899,7 +893,7 @@ int main(int argc, char** argv) {
     state.fFontSpacing = std::min(1.0f, gFont->getSpacing());
 
     dm.w = std::min<float>(dm.w, state.fFontAdvanceWidth * DEFAULT_ROW);
-    dm.h = std::min<float>(dm.h, (state.fFontSize + state.fFontSpacing) * (DEFAULT_COL + 1) - state.fFontSpacing);
+    dm.h = std::min<float>(dm.h, (state.fFontSize + state.fFontSpacing) * (DEFAULT_COL + 2) - state.fFontSpacing);
 
     SDL_Window* window = SDL_CreateWindow("SkTerminal", SDL_WINDOWPOS_CENTERED,
                                           SDL_WINDOWPOS_CENTERED, dm.w, dm.h, windowFlags);
@@ -931,8 +925,6 @@ int main(int argc, char** argv) {
 
     int dw, dh;
     SDL_GL_GetDrawableSize(window, &dw, &dh);
-
-    SkDebugf("dw %d dh %d\n", dw, dh);
 
     glViewport(0, 0, dw, dh);
     glClearColor(1, 1, 1, 1);
@@ -1011,8 +1003,6 @@ int main(int argc, char** argv) {
 
     tsm_screen_new(&screen, log_tsm, screen);
     tsm_screen_set_max_sb(screen, 10240);
-
-    SkDebugf("resize row %d col %d\n", ws_row, ws_col);
     tsm_screen_resize(screen, ws_row, ws_col);
 
     tsm_vte_new(&vte, screen, term_write_cb, reinterpret_cast<void*>(static_cast<intptr_t>(fd)), log_tsm, screen);
@@ -1033,7 +1023,6 @@ int main(int argc, char** argv) {
         read_len = term_read_cb(vte, buffer, sizeof(buffer), fd);
 
         if (read_len > 0) {
-            SkDebugf("read %d %ld\n", fd, read_len);
             tsm_vte_input(vte, buffer, read_len);
             state.fRedraw = true;
         } else if (read_len == 0) {
@@ -1041,7 +1030,6 @@ int main(int argc, char** argv) {
         }
 
         if (state.fRedraw) {
-            SkDebugf("redraw term\n");
             struct tsm_screen_attr a;
             tsm_vte_get_def_attr(vte, &a);
             SkColor bc = term_get_bc_from_attr(&a);

@@ -25,6 +25,9 @@
 #include <OpenGL/gl.h>
 #elif defined(SK_BUILD_FOR_IOS)
 #include <OpenGLES/ES2/gl.h>
+#elif defined(SK_BUILD_FOR_WIN)
+#include <windows.h>
+#include <GL/gl.h>
 #endif
 
 /*
@@ -103,7 +106,7 @@ static SkPath create_star() {
     return concavePath;
 }
 
-#if defined(SK_BUILD_FOR_ANDROID)
+#if defined(SK_BUILD_FOR_ANDROID) || defined(SK_BUILD_FOR_WIN)
 int SDL_main(int argc, char** argv) {
 #else
 int main(int argc, char** argv) {
