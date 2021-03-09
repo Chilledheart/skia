@@ -916,6 +916,9 @@ int main(int argc, char** argv) {
     // To go fullscreen
     // SDL_SetWindowFullscreen(window, SDL_WINDOW_FULLSCREEN);
 
+    // Disable resize until we handle it correctly (as Terminal.app)
+    SDL_SetWindowResizable(window, SDL_FALSE);
+
     // try and setup a GL context
     glContext = SDL_GL_CreateContext(window);
     if (!glContext) {
