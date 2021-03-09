@@ -79,6 +79,8 @@ struct ApplicationState {
     float fFontSize;
     float fFontAdvanceWidth;
     float fFontSpacing;
+    float fWidthScale;
+    float fHeightScale;
 };
 
 static void handle_error() {
@@ -97,11 +99,16 @@ static void handle_size_change(ApplicationState* state, SDL_Window* window, SkCa
 
     SDL_GL_GetDrawableSize(window, &dw, &dh);
 
+    glViewport(0, 0, dw, dh);
+    glClearColor(1, 1, 1, 1);
+    glClearStencil(0);
+    glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+
 #if !defined(SK_BUILD_FOR_WIN)
-    // TODO handle scale correctly (see init part)
     struct winsize ws;
-    ws.ws_row = (float)(dw) / state->fFontAdvanceWidth;
-    ws.ws_col = (float)(dh + state->fFontSpacing) / (state->fFontSize + state->fFontSpacing) - 1;
+
+    ws.ws_row = (dw / state->fWidthScale) / state->fFontAdvanceWidth;
+    ws.ws_col = (dh / state->fHeightScale + state->fFontSpacing) / (state->fFontSize + state->fFontSpacing) - 1;
     ws.ws_xpixel = dw;
     ws.ws_ypixel = dh;
     SkDebugf("resize row %d col %d\n", ws.ws_row, ws.ws_col);
@@ -246,7 +253,7 @@ static void handle_events(ApplicationState* state, SDL_Window* window, SkCanvas*
                 break;
             }
 #if 0
-            case SDL_WINDOWEVENT:
+            case SDL_WINDOWEVENT: {
                 switch (event.window.event) {
                     case SDL_WINDOWEVENT_RESIZED:
                         // Use SDL_GL_GetDrawableSize to measure the layout change
@@ -893,8 +900,10 @@ int main(int argc, char** argv) {
     state.fFontAdvanceWidth = gFont->measureText("X", 1U, SkTextEncoding::kUTF8, NULL);
     state.fFontSpacing = std::min(1.0f, gFont->getSpacing());
 
+    SkDebugf("default: row %d col %d\n", DEFAULT_ROW, DEFAULT_COL);
     dm.w = std::min<float>(dm.w, state.fFontAdvanceWidth * DEFAULT_ROW);
     dm.h = std::min<float>(dm.h, (state.fFontSize + state.fFontSpacing) * (DEFAULT_COL + 2) - state.fFontSpacing);
+    SkDebugf("dm: dw %d dh %d\n", dm.w, dm.h);
 
     SDL_Window* window = SDL_CreateWindow("SkTerminal", SDL_WINDOWPOS_CENTERED,
                                           SDL_WINDOWPOS_CENTERED, dm.w, dm.h, windowFlags);
@@ -926,6 +935,7 @@ int main(int argc, char** argv) {
 
     int dw, dh;
     SDL_GL_GetDrawableSize(window, &dw, &dh);
+    SkDebugf("init: dw %d dh %d\n", dw, dh);
 
     glViewport(0, 0, dw, dh);
     glClearColor(1, 1, 1, 1);
@@ -976,6 +986,9 @@ int main(int argc, char** argv) {
 
     SkCanvas* canvas = surface->getCanvas();
     canvas->scale((float)dw / dm.w, (float)dh / dm.h);
+    state.fWidthScale = (float)dw / dm.w;
+    state.fHeightScale = (float)dh / dm.h;
+    SkDebugf("scale: width: %.02f, height: %.02f\n", state.fWidthScale, state.fHeightScale);
 
     SkPaint paint;
     paint.setAntiAlias(true);
