@@ -98,6 +98,7 @@ static void handle_size_change(ApplicationState* state, SDL_Window* window, SkCa
     SDL_GL_GetDrawableSize(window, &dw, &dh);
 
 #if !defined(SK_BUILD_FOR_WIN)
+    // TODO handle scale correctly (see init part)
     struct winsize ws;
     ws.ws_row = (float)(dw) / state->fFontAdvanceWidth;
     ws.ws_col = (float)(dh + state->fFontSpacing) / (state->fFontSize + state->fFontSpacing) - 1;
@@ -991,8 +992,9 @@ int main(int argc, char** argv) {
     sk_sp<SkImage> image = cpuSurface->makeImageSnapshot();
 
     int fd {-1};
-    int ws_row = (float)(dw) / state.fFontAdvanceWidth;
-    int ws_col = (float)(dh + state.fFontSpacing) / (state.fFontSize + state.fFontSpacing) - 1;
+    int ws_row = (float)(dm.w) / state.fFontAdvanceWidth;
+    int ws_col = (float)(dm.h + state.fFontSpacing) / (state.fFontSize + state.fFontSpacing) - 1;
+    SkDebugf("init: row %d col %d\n", ws_row, ws_col);
     if (!create_conpty(dw, dh, ws_row, ws_col, &fd, &state)) {
         return -1;
     }
