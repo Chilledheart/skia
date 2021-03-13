@@ -20,7 +20,6 @@ third_party("libtsm") {
     "../externals/libtsm/src/tsm/tsm-unicode.c",
     "../externals/libtsm/src/tsm/tsm-vte.c",
     "../externals/libtsm/src/shared/shl-htable.c",
-    "../externals/libtsm/src/shared/shl-ring.c",
     "../externals/libtsm/external/wcwidth.c",
   ]
   defines = []
