@@ -32,9 +32,13 @@
 
 #if defined(SK_BUILD_FOR_WIN)
 #include <winsock2.h>
+#ifndef EXTENDED_STARTUPINFO_PRESENT
 #define EXTENDED_STARTUPINFO_PRESENT 0x00080000
+#endif
+#ifndef PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE
 #define PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE \
   ProcThreadAttributeValue(22, FALSE, TRUE, FALSE)
+#endif
 
 typedef HRESULT (__stdcall *PFNCREATEPSEUDOCONSOLE)(COORD c, HANDLE hIn, HANDLE hOut, DWORD dwFlags, HPCON* phpcon);
 typedef HRESULT (__stdcall *PFNRESIZEPSEUDOCONSOLE)(HPCON hpc, COORD newSize);
@@ -66,6 +70,14 @@ extern char **environ;
 #define DEFAULT_ROW 80
 #define DEFAULT_COL 24
 
+#ifdef SK_BUILD_FOR_WIN
+#define DEFAULT_FONT "Consolas"
+#else
+#define DEFAULT_FONT "monospace"
+#endif
+
+static bool resize_conpty(int dw, int dh, int ws_row, int ws_col, int fd);
+
 /*
  * This application is a simple example of how to combine SDL and Skia it demonstrates:
  *   how to setup gpu rendering to the main window
@@ -83,11 +95,15 @@ struct ApplicationState {
     float fFontSize;
     float fFontAdvanceWidth;
     float fFontSpacing;
-    float fWidthScale;
-    float fHeightScale;
+    double fWidthScale;
+    double fHeightScale;
     int32_t fRow;
     int32_t fCol;
-    bool fResize;
+    int32_t fDw;
+    int32_t fDh;
+#ifdef SK_BUILD_FOR_WIN
+    HANDLE listen_thread;
+#endif
 };
 
 static void handle_error() {
@@ -114,20 +130,17 @@ static void handle_size_change(ApplicationState* state, SDL_Window* window, SkCa
 
     gState->fRow = (dw / state->fWidthScale) / state->fFontAdvanceWidth;
     gState->fCol = (dh / state->fHeightScale + state->fFontSpacing) / (state->fFontSize + state->fFontSpacing) - 1;
-    gState->fResize = true;
+    gState->fDw = dw;
+    gState->fDh = dh;
 
-#if !defined(SK_BUILD_FOR_WIN)
-    struct winsize ws;
+    SkDebugf("resize row %d col %d\n", gState->fRow, gState->fCol);
 
-    ws.ws_row = gState->fRow;
-    ws.ws_col = gState->fCol;
-    ws.ws_xpixel = dw;
-    ws.ws_ypixel = dh;
-    SkDebugf("resize row %d col %d\n", ws.ws_row, ws.ws_col);
-    tsm_screen_resize(screen, ws.ws_row, ws.ws_col);
-    ioctl(fd, TIOCSWINSZ, &ws);
+    if (!resize_conpty(dw, dh, gState->fRow, gState->fCol, fd)) {
+        SkDebugf("resize_conpty: failed to resize conpty");
+        return;
+    }
+    tsm_screen_resize(screen, gState->fRow, gState->fCol);
     state->fRedraw = true;
-#endif
 }
 
 static void handle_events(ApplicationState* state, SDL_Window* window, SkCanvas* canvas,
@@ -152,7 +165,7 @@ static void handle_events(ApplicationState* state, SDL_Window* window, SkCanvas*
                 break;
             case SDL_KEYDOWN: {
                 SDL_Keycode key = event.key.keysym.sym;
-                SDL_Scancode scancode = SDL_GetScancodeFromKey(key);
+                // SDL_Scancode scancode = SDL_GetScancodeFromKey(key);
                 uint16_t modifier = event.key.keysym.mod;
 
                 /* SHIFT + UP/DOWN/PAGEUP/PAGEDOWN */
@@ -257,7 +270,6 @@ static void handle_events(ApplicationState* state, SDL_Window* window, SkCanvas*
                     // TBD paste to vte
                 }
 #endif
-
                 if (tsm_vte_handle_keyboard(vte, key, 0, 0, key)) {
                   tsm_screen_sb_reset(screen);
                 }
@@ -331,14 +343,36 @@ struct listen_ctx {
     int socket;
 };
 
+static listen_ctx *gListenCtx;
+
+HRESULT WriteFileN(HANDLE hFile, LPCVOID lpBuffer, DWORD nNumberOfBytesToWrite, LPDWORD lpNumberOfBytesWritten, LPOVERLAPPED lpOverlapped) {
+    DWORD numberOfBytesWritten;
+    HRESULT hr = S_OK;
+    *lpNumberOfBytesWritten = 0;
+    while (nNumberOfBytesToWrite) {
+        numberOfBytesWritten = 0;
+        if (!::WriteFile(hFile, lpBuffer, nNumberOfBytesToWrite, &numberOfBytesWritten, lpOverlapped)) {
+            // TODO: handle with GetLastError() == ERROR_IO_PENDING
+            int lastError = GetLastError();
+            if (lastError == ERROR_IO_PENDING) {
+                continue;
+            }
+            hr = HRESULT_FROM_WIN32(lastError);
+            return hr;
+        }
+
+        *lpNumberOfBytesWritten += numberOfBytesWritten;
+        lpBuffer = reinterpret_cast<const char*>(lpBuffer) + numberOfBytesWritten;
+        nNumberOfBytesToWrite -= numberOfBytesWritten;
+    }
+    return hr;
+}
+
 void __cdecl listen_wndc(LPVOID lp) {
     listen_ctx *ctx { reinterpret_cast<listen_ctx*>(lp) };
     // Close ConPTY - this will terminate client process if running
     HANDLE hLibrary = EnsureKernel32Loaded();
-    PFNRESIZEPSEUDOCONSOLE const ResizePseudoConsole = (PFNRESIZEPSEUDOCONSOLE)GetProcAddress((HMODULE)hLibrary, "ResizePseudoConsole");
-    if (ResizePseudoConsole == nullptr) {
-        return;
-    }
+    HRESULT hr = S_OK;
     PFNCLOSEPSEUDOCONSOLE const ClosePseudoConsole = (PFNCLOSEPSEUDOCONSOLE)GetProcAddress((HMODULE)hLibrary, "ClosePseudoConsole");
     if (ClosePseudoConsole == nullptr) {
         return;
@@ -350,61 +384,49 @@ void __cdecl listen_wndc(LPVOID lp) {
     DWORD dwBytesWritten{};
     DWORD dwBytesRead{};
     BOOL fRead{ FALSE };
+    OVERLAPPED ovWrite = {}, ovRead = {};
     do
     {
-        if (gState->fResize) {
-            HRESULT hr = S_OK;
-            int32_t ws_row = gState->fRow;
-            int32_t ws_col = gState->fCol;
-            gState->fResize = false;
-            gState->fRedraw = true;
-            // Retrieve width and height dimensions of display in
-            // characters using theoretical height/width functions
-            // that can retrieve the properties from the display
-            // attached to the event.
-            COORD consize;
-            consize.X = ws_row;
-            consize.Y = ws_col;
-
-            hr = ResizePseudoConsole(ctx->hPC, consize);
-            if (FAILED(hr)) {
-                SkDebugf("resize: %s", std::system_category().message(hr).c_str());
-                break;
-            }
-        }
         // Read from the pipe
         fRead = ::ReadFile(ctx->outPipeOurSide, szBuffer, BUFF_SIZE, &dwBytesRead, NULL);
+        SkDebugf("ReadFile: read stdout %d\n", dwBytesRead);
         if (!fRead) {
             break;
         }
-        ::WriteFile((HANDLE)ctx->socket, szBuffer, fRead, &dwBytesWritten, NULL);
-
+        hr = WriteFileN(reinterpret_cast<HANDLE>(ctx->socket), szBuffer, dwBytesRead, &dwBytesWritten, &ovWrite);
+        if (FAILED(hr)) {
+            SkDebugf("WriteFileN: write tsm error %s",
+                std::system_category().message(hr).c_str());
+            break;
+        }
+        SkDebugf("WriteFileN: write tsm %d\n", dwBytesWritten);
         // Write received text to the Console
         // Note: Write to the Console using WriteFile(hConsole...), not printf()/puts() to
         // prevent partially-read VT sequences from corrupting output
-        fRead = ::ReadFile((HANDLE)ctx->socket, szBuffer, BUFF_SIZE, &dwBytesRead, NULL);
+        fRead = ::ReadFile(reinterpret_cast<HANDLE>(ctx->socket), szBuffer, BUFF_SIZE, &dwBytesRead, &ovRead);
         if (!fRead) {
+            int lastError = GetLastError();
+            if (lastError == ERROR_IO_PENDING) {
+                fRead = true;
+                continue;
+            }
+            hr = HRESULT_FROM_WIN32(lastError);
+            SkDebugf("ReadFile: read tsm error %s",
+                std::system_category().message(hr).c_str());
             break;
         }
-        ::WriteFile(ctx->inPipeOurSide, szBuffer, fRead, &dwBytesWritten, NULL);
+        SkDebugf("ReadFile: read tsm %d\n", dwBytesRead);
+        ::WriteFile(ctx->inPipeOurSide, szBuffer, dwBytesRead, &dwBytesWritten, NULL);
+        SkDebugf("WriteFile: stdin %d\n", dwBytesWritten);
     } while (fRead && dwBytesRead >= 0);
 
-    // Close ConPTY - this will terminate client process if running
-    ClosePseudoConsole(ctx->hPC);
-    // Clean-up the pipes
-    ::CloseHandle(ctx->inPipeOurSide);
-    ::CloseHandle(ctx->outPipeOurSide);
-    ::closesocket(ctx->socket);
-    // Now safe to clean-up client app's process-info & thread
-    ::CloseHandle(ctx->hThread);
-    ::CloseHandle(ctx->hProcess);
-
-    delete ctx;
+    SkDebugf("EOF\n");
+    gState->fQuit = true;
 }
 
 // inspired by vim's channel.c
 #pragma comment(lib, "Ws2_32.lib")
-int socket_pair(int *sfd, int *cfd) {
+int socketpair(int *sfd, int *cfd) {
     //-------------------------
     // Initialize Winsock
     WSADATA wsaData;
@@ -428,6 +450,7 @@ int socket_pair(int *sfd, int *cfd) {
     }
 
     server.sin_family = AF_INET;
+    server.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     server.sin_port = htons(0);
     if (::bind(fd, (struct sockaddr*)&server, sizeof(server)) < 0 ||
         ::listen(fd, 1) < 0 ||
@@ -438,7 +461,7 @@ int socket_pair(int *sfd, int *cfd) {
     }
     if (::connect(server_fd, (struct sockaddr*)&server, sizeof(server)) < 0) {
         int err = WSAGetLastError();
-        if (err != WSAEWOULDBLOCK && err != WSAEINPROGRESS) {
+        if (err != WSAEWOULDBLOCK && err != WSAEINPROGRESS && err != WSAEINTR) {
             SkDebugf("Error at connect()\n");
             goto fail;
         }
@@ -462,7 +485,7 @@ fail:
     return -1;
 }
 
-bool create_conpty(int dw, int dh, int ws_row, int ws_col, int *fd, ApplicationState *state) {
+static bool create_conpty(int dw, int dh, int ws_row, int ws_col, int *fd, ApplicationState *state) {
     HANDLE hLibrary = EnsureKernel32Loaded();
     HRESULT hr = S_OK;
     PFNCREATEPSEUDOCONSOLE const CreatePseudoConsole = (PFNCREATEPSEUDOCONSOLE)GetProcAddress((HMODULE)hLibrary, "CreatePseudoConsole");
@@ -470,7 +493,6 @@ bool create_conpty(int dw, int dh, int ws_row, int ws_col, int *fd, ApplicationS
         return false;
     }
 
-    HANDLE thread;
     HANDLE outPipeOurSide, inPipeOurSide;
     HANDLE outPipePseudoConsoleSide, inPipePseudoConsoleSide;
     HPCON hPC = 0;
@@ -483,7 +505,8 @@ bool create_conpty(int dw, int dh, int ws_row, int ws_col, int *fd, ApplicationS
     if (!::CreatePipe(&inPipePseudoConsoleSide, &inPipeOurSide, NULL, 0) ||
         !::CreatePipe(&outPipeOurSide, &outPipePseudoConsoleSide, NULL, 0)) {
         hr = HRESULT_FROM_WIN32(GetLastError());
-        SkDebugf("conpty: CreatePipe %s\n", std::system_category().message(hr).c_str());
+        SkDebugf("conpty: CreatePipe %s\n",
+            std::system_category().message(hr).c_str());
         return false;
     }
 
@@ -492,7 +515,8 @@ bool create_conpty(int dw, int dh, int ws_row, int ws_col, int *fd, ApplicationS
     consize.Y = ws_col;
     hr = CreatePseudoConsole(consize, inPipePseudoConsoleSide, outPipePseudoConsoleSide, 0, &hPC);
     if (FAILED(hr)) {
-        SkDebugf("conpty: CreatePseudoConsole %n\n", std::system_category().message(hr).c_str());
+        SkDebugf("conpty: CreatePseudoConsole %n\n",
+            std::system_category().message(hr).c_str());
         return false;
     }
 
@@ -502,9 +526,12 @@ bool create_conpty(int dw, int dh, int ws_row, int ws_col, int *fd, ApplicationS
 
     hr = InitializeStartupInfoAttachedToConPTY(&startupInfoEx, hPC);
     if (FAILED(hr)) {
-        SkDebugf("conpty: InitializeStartupInfoAttachedToConPTY %s\n", std::system_category().message(hr).c_str());
+        SkDebugf("conpty: InitializeStartupInfoAttachedToConPTY %s\n",
+            std::system_category().message(hr).c_str());
         ::CloseHandle(inPipeOurSide);
         ::CloseHandle(outPipeOurSide);
+        ::CloseHandle(inPipePseudoConsoleSide);
+        ::CloseHandle(outPipePseudoConsoleSide);
         return false;
     }
 
@@ -529,7 +556,8 @@ bool create_conpty(int dw, int dh, int ws_row, int ws_col, int *fd, ApplicationS
 
     if (!fSuccess) {
         hr = HRESULT_FROM_WIN32(GetLastError());
-        SkDebugf("conpty: CreateProcessW %s\n", std::system_category().message(hr).c_str());
+        SkDebugf("conpty: CreateProcessW %s\n",
+            std::system_category().message(hr).c_str());
         ::CloseHandle(inPipeOurSide);
         ::CloseHandle(outPipeOurSide);
         goto cleanup;
@@ -540,9 +568,10 @@ bool create_conpty(int dw, int dh, int ws_row, int ws_col, int *fd, ApplicationS
     ctx->hPC = hPC;
     ctx->hThread = process_information.hThread;
     ctx->hProcess = process_information.hProcess;
-    if (socket_pair(&ctx->socket, &client) < 0) {
+    if (socketpair(&ctx->socket, &client) < 0) {
         hr = HRESULT_FROM_WIN32(GetLastError());
-        SkDebugf("conpty: socket_pair %s\n", std::system_category().message(hr).c_str());
+        SkDebugf("conpty: socketpair %s\n",
+            std::system_category().message(hr).c_str());
         fSuccess = false;
         goto cleanup;
     }
@@ -550,7 +579,9 @@ bool create_conpty(int dw, int dh, int ws_row, int ws_col, int *fd, ApplicationS
 
     // Create & start thread to listen to the incoming pipe
     // Note: Using CRT-safe _beginthread() rather than CreateThread()
-    thread = reinterpret_cast<HANDLE>(_beginthread(listen_wndc, 0, ctx));
+    gListenCtx = ctx;
+    gState->listen_thread = reinterpret_cast<HANDLE>(_beginthread(listen_wndc, 0, ctx));
+    SkDebugf("listen thread began\n");
 
 cleanup:
     ::DeleteProcThreadAttributeList(startupInfoEx.lpAttributeList);
@@ -559,8 +590,51 @@ cleanup:
     ::CloseHandle(outPipePseudoConsoleSide);
     return fSuccess;
 }
+
+static bool resize_conpty(int dw, int dh, int ws_row, int ws_col, int /*fd*/) {
+    HANDLE hLibrary = EnsureKernel32Loaded();
+    HRESULT hr = S_OK;
+    PFNRESIZEPSEUDOCONSOLE const ResizePseudoConsole = (PFNRESIZEPSEUDOCONSOLE)GetProcAddress((HMODULE)hLibrary, "ResizePseudoConsole");
+    if (ResizePseudoConsole == nullptr) {
+        return false;
+    }
+
+    // Retrieve width and height dimensions of display in
+    // characters using theoretical height/width functions
+    // that can retrieve the properties from the display
+    // attached to the event.
+    COORD consize;
+    consize.X = ws_row;
+    consize.Y = ws_col;
+
+    hr = ResizePseudoConsole(gListenCtx->hPC, consize);
+    if (FAILED(hr)) {
+        SkDebugf("resize: ResizePseudoConsole %s",
+            std::system_category().message(hr).c_str());
+        return false;
+    }
+    return true;
+}
+
+static void close_conpty(int /*fd*/) {
+    listen_ctx* ctx = gListenCtx;
+
+    // Close ConPTY - this will terminate client process if running
+    ClosePseudoConsole(ctx->hPC);
+    // Clean-up the pipes
+    ::CloseHandle(ctx->inPipeOurSide);
+    ::CloseHandle(ctx->outPipeOurSide);
+    ::closesocket(ctx->socket);
+    // Now safe to clean-up client app's process-info & thread
+    ::CloseHandle(ctx->hThread);
+    ::TerminateProcess(ctx->hProcess, /*uExitCode*/ 0);
+    ::CloseHandle(ctx->hProcess);
+
+    delete ctx;
+    gListenCtx = nullptr;
+}
 #else
-bool create_conpty(int dw, int dh, int ws_row, int ws_col, int *fd, ApplicationState *state) {
+static bool create_conpty(int dw, int dh, int ws_row, int ws_col, int *fd, ApplicationState *state) {
     struct termios term {};
     struct winsize ws {};
 
@@ -619,6 +693,25 @@ bool create_conpty(int dw, int dh, int ws_row, int ws_col, int *fd, ApplicationS
 
     return true;
 }
+
+static bool resize_conpty(int dw, int dh, int ws_row, int ws_col, int fd) {
+    struct winsize ws;
+
+    ws.ws_row = ws_row;
+    ws.ws_col = ws_col;
+    ws.ws_xpixel = dw;
+    ws.ws_ypixel = dh;
+
+    if (ioctl(fd, TIOCSWINSZ, &ws) < 0) {
+        SkDebugf("resize_conpty: TIOCSWINSZ %s", strerror(errno));
+        return false;
+    }
+    return true;
+}
+
+static void close_conpty(int fd) {
+    close(fd);
+}
 #endif
 
 // Creates a star type shape using a SkPath
@@ -655,10 +748,27 @@ static void log_tsm(void* data, const char* file, int line, const char* fn, cons
 #if defined(SK_BUILD_FOR_WIN)
 static void term_write_cb(struct tsm_vte* vte, const char* u8, size_t len, void* data) {
     int fd = reinterpret_cast<intptr_t>(data);
-    send(fd, u8, len, 0);
+    int send_len = send(fd, u8, len, 0);
+    if (send_len < 0) {
+        int lastError = GetLastError();
+        if (lastError != ERROR_IO_PENDING && lastError != WSAEWOULDBLOCK) {
+            HRESULT hr = HRESULT_FROM_WIN32(lastError);
+            SkDebugf("term_write_cb: send %s\n",
+                std::system_category().message(hr).c_str());
+        }
+    }
 }
 static int term_read_cb(struct tsm_vte* vte, char* u8, size_t len, int fd) {
-    return recv(fd, u8, len, 0);
+    int read_len = recv(fd, u8, len, 0);
+    if (read_len < 0) {
+        int lastError = GetLastError();
+        if (lastError != ERROR_IO_PENDING && lastError != WSAEWOULDBLOCK) {
+            HRESULT hr = HRESULT_FROM_WIN32(lastError);
+            SkDebugf("term_read_cb: recv %s\n",
+                std::system_category().message(hr).c_str());
+        }
+    }
+    return read_len;
 }
 #else
 static void term_write_cb(struct tsm_vte* vte, const char* u8, size_t len, void* data) {
@@ -713,7 +823,7 @@ static uint8_t VTE_COLOR_palette[VTE_COLOR_NUM][3] = {
         [VTE_COLOR_FOREGROUND] = {229, 229, 229}, /* light grey */
         [VTE_COLOR_BACKGROUND] = {0, 0, 0},       /* black */
 };
-
+#if 0
 static uint8_t VTE_COLOR_palette_solarized[VTE_COLOR_NUM][3] = {
         [VTE_COLOR_BLACK] = {7, 54, 66},             /* black */
         [VTE_COLOR_RED] = {220, 50, 47},             /* red */
@@ -779,6 +889,7 @@ static uint8_t VTE_COLOR_palette_solarized_white[VTE_COLOR_NUM][3] = {
         [VTE_COLOR_FOREGROUND] = {7, 54, 66},     /* black */
         [VTE_COLOR_BACKGROUND] = {238, 232, 213}, /* light grey */
 };
+#endif
 
 static SkColor term_get_fc_from_attr(const struct tsm_screen_attr* attr) {
     uint8_t fr = attr->fr, fg = attr->fg, fb = attr->fb;
@@ -790,9 +901,9 @@ static SkColor term_get_fc_from_attr(const struct tsm_screen_attr* attr) {
 
         if (code >= VTE_COLOR_NUM) code = VTE_COLOR_FOREGROUND;
 
-        fr = VTE_COLOR_palette_solarized_white[code][0];
-        fg = VTE_COLOR_palette_solarized_white[code][1];
-        fb = VTE_COLOR_palette_solarized_white[code][2];
+        fr = VTE_COLOR_palette[code][0];
+        fg = VTE_COLOR_palette[code][1];
+        fb = VTE_COLOR_palette[code][2];
     }
 
     return SkColorSetARGB(0xFF, fr, fg, fb);
@@ -807,9 +918,9 @@ static SkColor term_get_bc_from_attr(const struct tsm_screen_attr* attr) {
 
         if (code >= VTE_COLOR_NUM) code = VTE_COLOR_BACKGROUND;
 
-        br = VTE_COLOR_palette_solarized_white[code][0];
-        bg = VTE_COLOR_palette_solarized_white[code][1];
-        bb = VTE_COLOR_palette_solarized_white[code][2];
+        br = VTE_COLOR_palette[code][0];
+        bg = VTE_COLOR_palette[code][1];
+        bb = VTE_COLOR_palette[code][2];
     }
 
     return SkColorSetARGB(0xFF, br, bg, bb);
@@ -906,6 +1017,7 @@ int SDL_main(int argc, char** argv) {
 #else
 int main(int argc, char** argv) {
 #endif
+
     uint32_t windowFlags = 0;
 
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
@@ -949,7 +1061,7 @@ int main(int argc, char** argv) {
     ApplicationState state {};
     gState = &state;
 
-    sk_sp<SkTypeface> typeface = SkTypeface::MakeFromName("monospace", SkFontStyle::Normal());
+    sk_sp<SkTypeface> typeface = SkTypeface::MakeFromName(DEFAULT_FONT, SkFontStyle::Normal());
     SkFont font(typeface, state.fFontSize);
     font.setEdging(SkFont::Edging::kAntiAlias);
     // font.setHinting(SkFontHinting::kFull);
@@ -970,7 +1082,7 @@ int main(int argc, char** argv) {
 
     SkDebugf("default: row %d col %d\n", DEFAULT_ROW, DEFAULT_COL);
     dm.w = std::min<float>(dm.w, state.fFontAdvanceWidth * DEFAULT_ROW);
-    dm.h = std::min<float>(dm.h, (state.fFontSize + state.fFontSpacing) * (DEFAULT_COL + 2) - state.fFontSpacing);
+    dm.h = std::min<float>(dm.h, (state.fFontSize + state.fFontSpacing) * (DEFAULT_COL + 1) - state.fFontSpacing);
     SkDebugf("dm: dw %d dh %d\n", dm.w, dm.h);
 
     SDL_Window* window = SDL_CreateWindow("SkTerminal", SDL_WINDOWPOS_CENTERED,
@@ -1108,8 +1220,8 @@ int main(int argc, char** argv) {
         int read_len = -1;
         char buffer[4096];
         read_len = term_read_cb(vte, buffer, sizeof(buffer), fd);
-
         if (read_len > 0) {
+            SkDebugf("term_read_cb: %d\n", read_len);
             tsm_vte_input(vte, buffer, read_len);
             state.fRedraw = true;
         } else if (read_len == 0) {
@@ -1149,7 +1261,7 @@ int main(int argc, char** argv) {
 
         // draw offscreen canvas
         canvas->save();
-        canvas->translate(dm.w / 2.0, dm.h / 2.0);
+        canvas->translate(state.fDw, state.fDh);
         canvas->rotate(rotation++);
         canvas->drawImage(image, -50.0f, -50.0f);
         canvas->restore();
@@ -1158,6 +1270,14 @@ int main(int argc, char** argv) {
 
         SDL_GL_SwapWindow(window);
     }
+
+#ifdef SK_BUILD_FOR_WIN
+    TerminateThread(state.listen_thread, /*dwExitCode*/ 0);
+    WaitForSingleObject(state.listen_thread, INFINITE);
+    SkDebugf("listen thread exited\n");
+#endif
+
+    close_conpty(fd);
 
     if (glContext) {
         SDL_GL_DeleteContext(glContext);
@@ -1168,5 +1288,6 @@ int main(int argc, char** argv) {
 
     // Quit SDL subsystems
     SDL_Quit();
+    SkDebugf("main thread exited\n");
     return 0;
 }
