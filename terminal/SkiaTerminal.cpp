@@ -65,6 +65,8 @@ extern char **environ;
 #endif
 #endif
 
+#include <cstdlib>
+
 #include <libtsm.h>
 
 #define DEFAULT_ROW 80
@@ -102,7 +104,8 @@ struct ApplicationState {
     int32_t fDw;
     int32_t fDh;
 #ifdef SK_BUILD_FOR_WIN
-    HANDLE listen_thread;
+    HANDLE fSendThread;
+    HANDLE fRecvThread;
 #endif
 };
 
@@ -368,15 +371,9 @@ HRESULT WriteFileN(HANDLE hFile, LPCVOID lpBuffer, DWORD nNumberOfBytesToWrite, 
     return hr;
 }
 
-void __cdecl listen_wndc(LPVOID lp) {
+void __cdecl send_wndc(LPVOID lp) {
     listen_ctx *ctx { reinterpret_cast<listen_ctx*>(lp) };
-    // Close ConPTY - this will terminate client process if running
-    HANDLE hLibrary = EnsureKernel32Loaded();
     HRESULT hr = S_OK;
-    PFNCLOSEPSEUDOCONSOLE const ClosePseudoConsole = (PFNCLOSEPSEUDOCONSOLE)GetProcAddress((HMODULE)hLibrary, "ClosePseudoConsole");
-    if (ClosePseudoConsole == nullptr) {
-        return;
-    }
 
     const DWORD BUFF_SIZE{ 512 };
     char szBuffer[BUFF_SIZE]{};
@@ -384,22 +381,60 @@ void __cdecl listen_wndc(LPVOID lp) {
     DWORD dwBytesWritten{};
     DWORD dwBytesRead{};
     BOOL fRead{ FALSE };
-    OVERLAPPED ovWrite = {}, ovRead = {};
+    OVERLAPPED ovWrite = {};
+
     do
     {
         // Read from the pipe
         fRead = ::ReadFile(ctx->outPipeOurSide, szBuffer, BUFF_SIZE, &dwBytesRead, NULL);
-        SkDebugf("ReadFile: read stdout %d\n", dwBytesRead);
+        SkDebugf("ReadFile(): read stdout %d\n", dwBytesRead);
         if (!fRead) {
             break;
         }
         hr = WriteFileN(reinterpret_cast<HANDLE>(ctx->socket), szBuffer, dwBytesRead, &dwBytesWritten, &ovWrite);
         if (FAILED(hr)) {
-            SkDebugf("WriteFileN: write tsm error %s",
+            SkDebugf("WriteFileN(): write tsm error %s\n",
                 std::system_category().message(hr).c_str());
             break;
         }
-        SkDebugf("WriteFileN: write tsm %d\n", dwBytesWritten);
+        SkDebugf("WriteFileN(): write tsm %d\n", dwBytesWritten);
+    } while (fRead && dwBytesRead >= 0);
+
+    SkDebugf("send EOF\n");
+    gState->fQuit = true;
+}
+
+void __cdecl recv_wndc(LPVOID lp) {
+    listen_ctx *ctx { reinterpret_cast<listen_ctx*>(lp) };
+    HRESULT hr = S_OK;
+
+    const DWORD BUFF_SIZE{ 512 };
+    char szBuffer[BUFF_SIZE]{};
+
+    DWORD dwBytesWritten{};
+    DWORD dwBytesRead{};
+    BOOL fRead{ FALSE };
+    OVERLAPPED ovRead = {};
+
+    fd_set rfds;
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = 10 * 1000;
+    do
+    {
+        FD_ZERO(&rfds);
+        FD_SET(reinterpret_cast<int>(ctx->socket), &rfds);
+        int retVal = select(1, &rfds, NULL, NULL, &tv);
+        if (retVal == -1) {
+            hr = HRESULT_FROM_WIN32(GetLastError());
+            SkDebugf("select(): read tsm error 0x%x %s\n", hr,
+                std::system_category().message(hr).c_str());
+            break;
+        } else if (retVal == 0) {
+            /* No data/event to socket */
+            fRead = true;
+            continue;
+        }
         // Write received text to the Console
         // Note: Write to the Console using WriteFile(hConsole...), not printf()/puts() to
         // prevent partially-read VT sequences from corrupting output
@@ -411,16 +446,16 @@ void __cdecl listen_wndc(LPVOID lp) {
                 continue;
             }
             hr = HRESULT_FROM_WIN32(lastError);
-            SkDebugf("ReadFile: read tsm error %s",
+            SkDebugf("ReadFile(): read tsm error 0x%x %s\n", hr,
                 std::system_category().message(hr).c_str());
             break;
         }
-        SkDebugf("ReadFile: read tsm %d\n", dwBytesRead);
+        SkDebugf("ReadFile(): read tsm %d\n", dwBytesRead);
         ::WriteFile(ctx->inPipeOurSide, szBuffer, dwBytesRead, &dwBytesWritten, NULL);
-        SkDebugf("WriteFile: stdin %d\n", dwBytesWritten);
+        SkDebugf("WriteFile(): stdin %d\n", dwBytesWritten);
     } while (fRead && dwBytesRead >= 0);
 
-    SkDebugf("EOF\n");
+    SkDebugf("recv EOF\n");
     gState->fQuit = true;
 }
 
@@ -580,8 +615,10 @@ static bool create_conpty(int dw, int dh, int ws_row, int ws_col, int *fd, Appli
     // Create & start thread to listen to the incoming pipe
     // Note: Using CRT-safe _beginthread() rather than CreateThread()
     gListenCtx = ctx;
-    gState->listen_thread = reinterpret_cast<HANDLE>(_beginthread(listen_wndc, 0, ctx));
-    SkDebugf("listen thread began\n");
+    gState->fSendThread = reinterpret_cast<HANDLE>(_beginthread(send_wndc, 0, ctx));
+    SkDebugf("send thread began\n");
+    gState->fRecvThread = reinterpret_cast<HANDLE>(_beginthread(recv_wndc, 0, ctx));
+    SkDebugf("recv thread began\n");
 
 cleanup:
     ::DeleteProcThreadAttributeList(startupInfoEx.lpAttributeList);
@@ -618,6 +655,12 @@ static bool resize_conpty(int dw, int dh, int ws_row, int ws_col, int /*fd*/) {
 
 static void close_conpty(int /*fd*/) {
     listen_ctx* ctx = gListenCtx;
+    // Close ConPTY - this will terminate client process if running
+    HANDLE hLibrary = EnsureKernel32Loaded();
+    PFNCLOSEPSEUDOCONSOLE const ClosePseudoConsole = (PFNCLOSEPSEUDOCONSOLE)GetProcAddress((HMODULE)hLibrary, "ClosePseudoConsole");
+    if (ClosePseudoConsole == nullptr) {
+        return;
+    }
 
     // Close ConPTY - this will terminate client process if running
     ClosePseudoConsole(ctx->hPC);
@@ -749,7 +792,7 @@ static void log_tsm(void* data, const char* file, int line, const char* fn, cons
 static void term_write_cb(struct tsm_vte* vte, const char* u8, size_t len, void* data) {
     int fd = reinterpret_cast<intptr_t>(data);
     int send_len = send(fd, u8, len, 0);
-    if (send_len < 0) {
+    if (send_len < 0 || send_len < len) {
         int lastError = GetLastError();
         if (lastError != ERROR_IO_PENDING && lastError != WSAEWOULDBLOCK) {
             HRESULT hr = HRESULT_FROM_WIN32(lastError);
@@ -1012,6 +1055,10 @@ static int draw_cb(struct tsm_screen* con,
     return 0;
 }
 
+/* Used by atexit handler */
+static SDL_GLContext glContext;
+static SDL_Window* window;
+
 #if defined(SK_BUILD_FOR_ANDROID) || defined(SK_BUILD_FOR_WIN)
 int SDL_main(int argc, char** argv) {
 #else
@@ -1023,7 +1070,7 @@ int main(int argc, char** argv) {
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
 
-    SDL_GLContext glContext = nullptr;
+    glContext = nullptr;
 #if defined(SK_BUILD_FOR_ANDROID) || defined(SK_BUILD_FOR_IOS)
     // For Android/iOS we need to set up for OpenGL ES and we make the window hi res & full screen
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
@@ -1085,8 +1132,7 @@ int main(int argc, char** argv) {
     dm.h = std::min<float>(dm.h, (state.fFontSize + state.fFontSpacing) * (DEFAULT_COL + 1) - state.fFontSpacing);
     SkDebugf("dm: dw %d dh %d\n", dm.w, dm.h);
 
-    SDL_Window* window = SDL_CreateWindow("SkTerminal", SDL_WINDOWPOS_CENTERED,
-                                          SDL_WINDOWPOS_CENTERED, dm.w, dm.h, windowFlags);
+    window = SDL_CreateWindow("SkTerminal", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, dm.w, dm.h, windowFlags);
 
     if (!window) {
         handle_error();
@@ -1272,22 +1318,28 @@ int main(int argc, char** argv) {
     }
 
 #ifdef SK_BUILD_FOR_WIN
-    TerminateThread(state.listen_thread, /*dwExitCode*/ 0);
-    WaitForSingleObject(state.listen_thread, INFINITE);
-    SkDebugf("listen thread exited\n");
+    TerminateThread(state.fSendThread, /*dwExitCode*/ 0);
+    WaitForSingleObject(state.fSendThread, INFINITE);
+    SkDebugf("send thread exited\n");
+    TerminateThread(state.fRecvThread, /*dwExitCode*/ 0);
+    WaitForSingleObject(state.fRecvThread, INFINITE);
+    SkDebugf("recv thread exited\n");
 #endif
 
     close_conpty(fd);
 
-    if (glContext) {
-        SDL_GL_DeleteContext(glContext);
-    }
+    std::atexit([]() {
+        if (glContext) {
+            SDL_GL_DeleteContext(glContext);
+        }
 
-    // Destroy window
-    SDL_DestroyWindow(window);
+        // Destroy window
+        SDL_DestroyWindow(window);
 
-    // Quit SDL subsystems
-    SDL_Quit();
-    SkDebugf("main thread exited\n");
+        // Quit SDL subsystems
+        SDL_Quit();
+        SkDebugf("main thread exited\n");
+    });
+
     return 0;
 }
