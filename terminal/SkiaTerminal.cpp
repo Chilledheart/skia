@@ -27,6 +27,7 @@
 #include <OpenGLES/ES2/gl.h>
 #elif defined(SK_BUILD_FOR_WIN)
 #include <windows.h>
+#include <shellscalingapi.h>
 #include <GL/gl.h>
 #endif
 
@@ -196,14 +197,14 @@ static void handle_events(ApplicationState* state, SDL_Window* window, SkCanvas*
                 /*  CTRL+SHIFT +/-  Zoom */
                 if (modifier & KMOD_SHIFT && modifier & KMOD_CTRL &&
                     !(modifier & KMOD_ALT)) {
-                    if (key == '=' /*SDLK_PLUS*/ && state->fFontSize + 1.0f <= 32.0) {
-                        state->fFontSize += 1.0;
+                    if (key == '=' /*SDLK_PLUS*/ && state->fFontSize + 1.0f / state->fWidthScale <= 32.0) {
+                        state->fFontSize += 1.0 / state->fWidthScale;
                         gFont->setSize(state->fFontSize);
                         gFontBold->setSize(state->fFontSize);
                         handle_size_change(state, window, canvas, fd, screen, vte);
                         return;
-                    } else if (key == SDLK_MINUS && state->fFontSize - 1.0f >= 8.0) {
-                        state->fFontSize -= 1.0;
+                    } else if (key == SDLK_MINUS && state->fFontSize - 1.0f / state->fWidthScale >= 8.0) {
+                        state->fFontSize -= 1.0 / state->fWidthScale;
                         gFont->setSize(state->fFontSize);
                         gFontBold->setSize(state->fFontSize);
                         handle_size_change(state, window, canvas, fd, screen, vte);
@@ -1062,6 +1063,89 @@ static int draw_cb(struct tsm_screen* con,
 static SDL_GLContext glContext;
 static SDL_Window* window;
 
+#ifdef SK_BUILD_FOR_WIN
+typedef std::pair<int, int> SkDPI;
+static SkDPI retrieveMonitorDPI(HMONITOR hMonitor)
+{
+    UINT dpiX;
+    UINT dpiY;
+
+    HRESULT hr = ::GetDpiForMonitor(hMonitor, MDT_EFFECTIVE_DPI, &dpiX, &dpiY);
+    if (FAILED(hr)) {
+        SkDebugf("GetDpiForMonitor(): %s\n",
+                std::system_category().message(hr).c_str());
+        return SkDPI(0, 0);
+    }
+
+    return SkDPI(dpiX, dpiY);
+}
+
+static bool iterateMonitorImpl(HMONITOR hMonitor, SkDPI *dpi_out)
+{
+    MONITORINFOEXW mi {};
+    mi.cbSize = sizeof(mi);
+
+    BOOL result = ::GetMonitorInfoW(hMonitor, &mi);
+    if (!result) {
+        HRESULT hr = HRESULT_FROM_WIN32(GetLastError());
+        SkDebugf("GetMonitorInfoA(): 0x%p %s\n", hMonitor,
+                std::system_category().message(hr).c_str());
+        return false;
+    }
+
+    if (std::wstring(mi.szDevice) == L"WinDisc") {
+        SkDebugf("ignore display device: 0x%p %ls\n", hMonitor,
+            mi.szDevice);
+        return false;
+    }
+
+    SkDebugf("retrieve display: %ls\n",mi.szDevice);
+
+    SkDPI dpi = retrieveMonitorDPI(hMonitor);
+    if (dpi.first && dpi.second) {
+        *dpi_out = dpi;
+        return true;
+    }
+
+    HDC hdc = ::CreateDCW(mi.szDevice, NULL, NULL, NULL);
+    if (!hdc) {
+        HRESULT hr = HRESULT_FROM_WIN32(GetLastError());
+        SkDebugf("CreateDC(): %ls %s\n", mi.szDevice,
+                std::system_category().message(hr).c_str());
+        return false;
+    }
+
+    *dpi_out = SkDPI(::GetDeviceCaps(hdc, LOGPIXELSX),
+        ::GetDeviceCaps(hdc, LOGPIXELSY));
+
+    DeleteDC(hdc);
+    return true;
+}
+
+static bool iterateMonitor(HMONITOR hMonitor, HDC /*hdc*/, LPRECT /*rect*/, LPARAM p)
+{
+    SkDPI *data = (SkDPI *)p;
+    /* if we have one, return directly */
+    if (iterateMonitorImpl(hMonitor, data)) {
+        return false;
+    }
+    return true;
+}
+
+static HRESULT retrieveDPI(SkDPI *dpi)
+{
+    HRESULT hr = S_OK;
+    BOOL result = ::EnumDisplayMonitors(NULL, NULL,
+        (MONITORENUMPROC)iterateMonitor, (LPARAM)dpi);
+    if (!result) {
+        hr = HRESULT_FROM_WIN32(GetLastError());
+        SkDebugf("EnumDisplayMonitors(): %s\n",
+                std::system_category().message(hr).c_str());
+    }
+    return hr;
+}
+#endif /* SK_BUILD_FOR_WIN */
+
 #if defined(SK_BUILD_FOR_ANDROID) || defined(SK_BUILD_FOR_WIN)
 int SDL_main(int argc, char** argv) {
 #else
@@ -1100,6 +1184,37 @@ int main(int argc, char** argv) {
     // SDL_GL_SetAttribute(SDL_GL_MULTISAMPLEBUFFERS, 1);
     // SDL_GL_SetAttribute(SDL_GL_MULTISAMPLESAMPLES, kMsaaSampleCount);
 
+#ifdef SK_BUILD_FOR_WIN
+    // It's currently possible to set DPI awareness programmatically on Windows,
+    // but not for Apple. If that’s not a deal breaker for you, you can set DPI awareness
+    // using "SetProcessDpiAwareness()", which you can call by including the header <ShellScalingAPI.h>
+    // and linking "Shcore.lib" to your project.
+    // Note that this call must be the first Window management-related call in your program,
+    // so you should probably call this at the very top of your main.
+#if 1
+    HRESULT hr = ::SetProcessDpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE);
+    if (FAILED(hr)) {
+        SkDebugf("SetProcessDpiAwareness(): %s\n",
+                std::system_category().message(hr).c_str());
+    }
+#else
+    BOOL result = ::SetProcessDPIAware();
+    HRESULT hr = S_OK;
+    if (!result) {
+        hr = HRESULT_FROM_WIN32(GetLastError());
+        SkDebugf("SetProcessDpiAware(): %s\n",
+                std::system_category().message(hr).c_str());
+    }
+#endif
+    SkDPI dpi;
+    hr = retrieveDPI(&dpi);
+    if (FAILED(hr)) {
+        SkDebugf("retrieveDPI(): %s\n",
+                std::system_category().message(hr).c_str());
+    }
+    SkDebugf("DPI x: %d y: %d\n", dpi.first, dpi.second);
+#endif
+
     /*
      * In a real application you might want to initialize more subsystems
      */
@@ -1110,6 +1225,14 @@ int main(int argc, char** argv) {
 
     ApplicationState state {};
     gState = &state;
+
+#ifdef SK_BUILD_FOR_WIN
+    gState->fWidthScale = 100.0 / dpi.first;
+    gState->fHeightScale = 100.0 / dpi.second;
+    gState->fFontSize = gState->fFontSize / gState->fWidthScale;
+#else
+    gState->fWidthScale = gState->fHeightScale = 1.00;
+#endif
 
     sk_sp<SkTypeface> typeface = SkTypeface::MakeFromName(DEFAULT_FONT, SkFontStyle::Normal());
     SkFont font(typeface, state.fFontSize);
@@ -1181,16 +1304,16 @@ int main(int argc, char** argv) {
     glClear(GL_COLOR_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
 
     // setup GrContext
-    auto interface = GrGLMakeNativeInterface();
+    auto glInterface = GrGLMakeNativeInterface();
 
     // setup contexts
-    sk_sp<GrDirectContext> grContext(GrDirectContext::MakeGL(interface));
+    sk_sp<GrDirectContext> grContext(GrDirectContext::MakeGL(glInterface));
     SkASSERT(grContext);
 
     // Wrap the frame buffer object attached to the screen in a Skia render target so Skia can
     // render to it
     GrGLint buffer;
-    GR_GL_GetIntegerv(interface.get(), GR_GL_FRAMEBUFFER_BINDING, &buffer);
+    GR_GL_GetIntegerv(glInterface.get(), GR_GL_FRAMEBUFFER_BINDING, &buffer);
     GrGLFramebufferInfo info;
     info.fFBOID = (GrGLuint)buffer;
     SkColorType colorType;
@@ -1223,9 +1346,9 @@ int main(int argc, char** argv) {
                                                                     colorType, nullptr, &props));
 
     SkCanvas* canvas = surface->getCanvas();
-    canvas->scale((float)dw / dm.w, (float)dh / dm.h);
-    state.fWidthScale = (float)dw / dm.w;
-    state.fHeightScale = (float)dh / dm.h;
+    canvas->scale((double)dw / dm.w, (double)dh / dm.h);
+    state.fWidthScale = (double)dw / dm.w;
+    state.fHeightScale = (double)dh / dm.h;
     SkDebugf("scale: width: %.02f, height: %.02f\n", state.fWidthScale, state.fHeightScale);
 
     SkPaint paint;
