@@ -425,7 +425,7 @@ void __cdecl recv_wndc(LPVOID lp) {
     do
     {
         FD_ZERO(&rfds);
-        FD_SET(reinterpret_cast<int>(ctx->socket), &rfds);
+        FD_SET(static_cast<SOCKET>(ctx->socket), &rfds);
         int retVal = select(1, &rfds, NULL, NULL, &tv);
         if (retVal == -1) {
             hr = HRESULT_FROM_WIN32(GetLastError());
