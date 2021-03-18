@@ -115,7 +115,7 @@ static void handle_error() {
     SDL_ClearError();
 }
 
-static SkFont *gFont;
+static SkFont *gFont, *gFontBold;
 static ApplicationState *gState;
 
 static void handle_size_change(ApplicationState* state, SDL_Window* window, SkCanvas* canvas,
@@ -199,11 +199,13 @@ static void handle_events(ApplicationState* state, SDL_Window* window, SkCanvas*
                     if (key == '=' /*SDLK_PLUS*/ && state->fFontSize + 1.0f <= 32.0) {
                         state->fFontSize += 1.0;
                         gFont->setSize(state->fFontSize);
+                        gFontBold->setSize(state->fFontSize);
                         handle_size_change(state, window, canvas, fd, screen, vte);
                         return;
                     } else if (key == SDLK_MINUS && state->fFontSize - 1.0f >= 8.0) {
                         state->fFontSize -= 1.0;
                         gFont->setSize(state->fFontSize);
+                        gFontBold->setSize(state->fFontSize);
                         handle_size_change(state, window, canvas, fd, screen, vte);
                         return;
                     }
@@ -996,6 +998,7 @@ static int draw_cb(struct tsm_screen* con,
     ApplicationState *state = ctx->state;
     SkPaint *paint = ctx->paint;
     bool bcOnly = ctx->bcOnly;
+    const SkFont *font = gFont;
 
     SkString string;
 
@@ -1037,7 +1040,7 @@ static int draw_cb(struct tsm_screen* con,
     }
 
     if (attr->bold) {
-        // TBD
+        font = gFontBold;
     }
 
     if (attr->protect) {
@@ -1050,7 +1053,7 @@ static int draw_cb(struct tsm_screen* con,
 
     paint->setColor(fc);
 
-    canvas->drawString(string, xoff, yoff, *gFont, *paint);
+    canvas->drawString(string, xoff, yoff, *font, *paint);
 
     return 0;
 }
@@ -1114,6 +1117,12 @@ int main(int argc, char** argv) {
     // font.setHinting(SkFontHinting::kFull);
 
     gFont = &font;
+
+    sk_sp<SkTypeface> typefaceBold = SkTypeface::MakeFromName(DEFAULT_FONT, SkFontStyle::Bold());
+    SkFont fontBold(typeface, state.fFontSize);
+    fontBold.setEdging(SkFont::Edging::kAntiAlias);
+    // fontBold.setHinting(SkFontHinting::kFull);
+    gFontBold = &fontBold;
 
     // Setup window
     // This code will create a window with the same resolution as the user's desktop.
