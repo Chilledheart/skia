@@ -74,7 +74,7 @@ extern char **environ;
 #define DEFAULT_COL 24
 
 #ifdef SK_BUILD_FOR_WIN
-#define DEFAULT_FONT "Consolas"
+#define DEFAULT_FONT "新宋体"
 #else
 #define DEFAULT_FONT "monospace"
 #endif
@@ -1227,8 +1227,8 @@ int main(int argc, char** argv) {
     gState = &state;
 
 #ifdef SK_BUILD_FOR_WIN
-    gState->fWidthScale = 100.0 / dpi.first;
-    gState->fHeightScale = 100.0 / dpi.second;
+    gState->fWidthScale = 96.0 / dpi.first;
+    gState->fHeightScale = 96.0 / dpi.second;
     gState->fFontSize = gState->fFontSize / gState->fWidthScale;
 #else
     gState->fWidthScale = gState->fHeightScale = 1.00;
